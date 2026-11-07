@@ -249,6 +249,9 @@ bitflags::bitflags! {
         /// `GL_ARB_shader_image_load_store`; GLES needs `GL_NV_image_formats`
         /// (which itself depends on `GL_EXT_texture_norm16`).
         const TEXTURE_FORMAT_NORM16_STORAGE = 1 << 20;
+        /// Supports `KHR_parallel_shader_compile` (or `ARB_parallel_shader_compile`), so
+        /// whether a program has finished linking can be asked without waiting for it.
+        const PARALLEL_SHADER_COMPILE = 1 << 21;
     }
 }
 
@@ -295,6 +298,10 @@ struct AdapterShared {
     shading_language_version: naga::back::glsl::Version,
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
+    /// The fence issued after the newest programs linked in the background, on a context
+    /// that cannot say when a link has completed: once it has signalled, every link issued
+    /// before it has completed.
+    link_fence: Mutex<Option<LinkFence>>,
     es: bool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
@@ -315,6 +322,7 @@ impl fmt::Debug for AdapterShared {
             shading_language_version,
             next_shader_id,
             program_cache: _,
+            link_fence: _,
             es,
             max_msaa_samples,
         } = self;
@@ -751,6 +759,76 @@ unsafe impl Sync for PipelineInner {}
 #[cfg(send_sync)]
 unsafe impl Send for PipelineInner {}
 
+/// A program, shared between the pipelines made from it and the program cache, and how far
+/// its link has come.
+#[derive(Debug)]
+struct Program {
+    raw: glow::Program,
+    state: Mutex<ProgramState>,
+}
+
+#[cfg(send_sync)]
+unsafe impl Sync for Program {}
+#[cfg(send_sync)]
+unsafe impl Send for Program {}
+
+impl Program {
+    /// The linked program, for a pipeline about to be used.
+    ///
+    /// # Panics
+    ///
+    /// If the program has not linked, which a pipeline begun with
+    /// [`crate::Device::begin_render_pipeline`] must not be used before.
+    fn inner(&self) -> Arc<PipelineInner> {
+        match *self.state.lock() {
+            ProgramState::Linked(ref inner) => Arc::clone(inner),
+            ProgramState::Linking(_) => {
+                panic!("A pipeline was used while its program was still linking.")
+            }
+            ProgramState::Failed(ref error) => {
+                panic!("A pipeline was used although its program failed to link: {error}")
+            }
+        }
+    }
+}
+
+/// How far a [`Program`]'s link has come.
+#[derive(Debug)]
+enum ProgramState {
+    /// Its stages have been compiled and the program linked, and nothing has yet been asked
+    /// of it, since asking would wait for the link.
+    Linking(Linking),
+    /// It linked, and can be drawn with.
+    Linked(Arc<PipelineInner>),
+    /// It failed to compile or to link, and its GL objects have been deleted.
+    Failed(crate::PipelineError),
+}
+
+/// What a program still linking needs once it has linked, gathered while its stages were
+/// translated.
+#[derive(Debug)]
+struct Linking {
+    shaders: ArrayVec<(naga::ShaderStage, glow::Shader), { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    stages: wgt::ShaderStages,
+    name_binding_map: NameBindingMap,
+    immediates_items:
+        ArrayVec<Vec<naga::back::glsl::ImmediateItem>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    sampler_map: SamplerBindMap,
+    clip_distance_count: u32,
+}
+
+/// The register and slot each uniform block and texture of a program is bound to, by name.
+type NameBindingMap = FastHashMap<String, (BindingRegister, u8)>;
+
+/// A fence issued after programs linked in the background ([`AdapterShared::link_fence`]).
+#[derive(Debug)]
+struct LinkFence(glow::Fence);
+
+#[cfg(send_sync)]
+unsafe impl Sync for LinkFence {}
+#[cfg(send_sync)]
+unsafe impl Send for LinkFence {}
+
 #[derive(Clone, Debug)]
 struct DepthState {
     function: u32,
@@ -791,11 +869,11 @@ struct ProgramCacheKey {
     group_to_binding_to_slot: Box<[Option<Box<[u8]>>]>,
 }
 
-type ProgramCache = FastHashMap<ProgramCacheKey, Result<Arc<PipelineInner>, crate::PipelineError>>;
+type ProgramCache = FastHashMap<ProgramCacheKey, Result<Arc<Program>, crate::PipelineError>>;
 
 #[derive(Debug)]
 pub struct RenderPipeline {
-    inner: Arc<PipelineInner>,
+    program: Arc<Program>,
     primitive: wgt::PrimitiveState,
     vertex_buffers: Box<[Option<VertexBufferDesc>]>,
     vertex_attributes: Box<[AttributeDesc]>,
@@ -813,7 +891,7 @@ static_assertions::assert_impl_all!(RenderPipeline: Send, Sync);
 
 #[derive(Debug)]
 pub struct ComputePipeline {
-    inner: Arc<PipelineInner>,
+    program: Arc<Program>,
 }
 
 impl crate::DynComputePipeline for ComputePipeline {}

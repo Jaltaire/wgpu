@@ -5,9 +5,10 @@ use crate::{
     BindGroupLayoutDescriptor, BufferDescriptor, BufferMapping, CommandEncoderDescriptor,
     ComputePipelineDescriptor, Device, DeviceError, FenceValue,
     GetAccelerationStructureBuildSizesDescriptor, Label, MemoryRange, PipelineCacheDescriptor,
-    PipelineCacheError, PipelineError, PipelineLayoutDescriptor, RayObjectIntersectionState,
-    RayTracingPipelineDescriptor, RenderPipelineDescriptor, SamplerDescriptor, ShaderError,
-    ShaderInput, ShaderModuleDescriptor, TextureDescriptor, TextureViewDescriptor, TlasInstance,
+    PipelineCacheError, PipelineCompilation, PipelineError, PipelineLayoutDescriptor,
+    RayObjectIntersectionState, RayTracingPipelineDescriptor, RenderPipelineDescriptor,
+    SamplerDescriptor, ShaderError, ShaderInput, ShaderModuleDescriptor, TextureDescriptor,
+    TextureViewDescriptor, TlasInstance,
 };
 
 use super::{
@@ -100,6 +101,18 @@ pub trait DynDevice: DynResource {
             dyn DynPipelineCache,
         >,
     ) -> Result<Box<dyn DynRenderPipeline>, PipelineError>;
+    unsafe fn begin_render_pipeline(
+        &self,
+        desc: &RenderPipelineDescriptor<
+            dyn DynPipelineLayout,
+            dyn DynShaderModule,
+            dyn DynPipelineCache,
+        >,
+    ) -> Result<Box<dyn DynRenderPipeline>, PipelineError>;
+    unsafe fn render_pipeline_compilation(
+        &self,
+        pipeline: &dyn DynRenderPipeline,
+    ) -> Result<PipelineCompilation, PipelineError>;
     unsafe fn destroy_render_pipeline(&self, pipeline: Box<dyn DynRenderPipeline>);
 
     unsafe fn create_compute_pipeline(
@@ -398,36 +411,27 @@ impl<D: Device + DynResource> DynDevice for D {
             dyn DynPipelineCache,
         >,
     ) -> Result<Box<dyn DynRenderPipeline>, PipelineError> {
-        let desc = RenderPipelineDescriptor {
-            label: desc.label,
-            layout: desc.layout.expect_downcast_ref(),
-            vertex_processor: match &desc.vertex_processor {
-                crate::VertexProcessor::Standard {
-                    vertex_buffers,
-                    vertex_stage,
-                } => crate::VertexProcessor::Standard {
-                    vertex_buffers,
-                    vertex_stage: vertex_stage.clone().expect_downcast(),
-                },
-                crate::VertexProcessor::Mesh {
-                    task_stage: task,
-                    mesh_stage: mesh,
-                } => crate::VertexProcessor::Mesh {
-                    task_stage: task.as_ref().map(|a| a.clone().expect_downcast()),
-                    mesh_stage: mesh.clone().expect_downcast(),
-                },
-            },
-            primitive: desc.primitive,
-            depth_stencil: desc.depth_stencil.clone(),
-            multisample: desc.multisample,
-            fragment_stage: desc.fragment_stage.clone().map(|f| f.expect_downcast()),
-            color_targets: desc.color_targets,
-            multiview_mask: desc.multiview_mask,
-            cache: desc.cache.map(|c| c.expect_downcast_ref()),
-        };
-
-        unsafe { D::create_render_pipeline(self, &desc) }
+        unsafe { D::create_render_pipeline(self, &downcast_render_pipeline_descriptor::<D>(desc)) }
             .map(|b| -> Box<dyn DynRenderPipeline> { Box::new(b) })
+    }
+
+    unsafe fn begin_render_pipeline(
+        &self,
+        desc: &RenderPipelineDescriptor<
+            dyn DynPipelineLayout,
+            dyn DynShaderModule,
+            dyn DynPipelineCache,
+        >,
+    ) -> Result<Box<dyn DynRenderPipeline>, PipelineError> {
+        unsafe { D::begin_render_pipeline(self, &downcast_render_pipeline_descriptor::<D>(desc)) }
+            .map(|b| -> Box<dyn DynRenderPipeline> { Box::new(b) })
+    }
+
+    unsafe fn render_pipeline_compilation(
+        &self,
+        pipeline: &dyn DynRenderPipeline,
+    ) -> Result<PipelineCompilation, PipelineError> {
+        unsafe { D::render_pipeline_compilation(self, pipeline.expect_downcast_ref()) }
     }
 
     unsafe fn destroy_render_pipeline(&self, pipeline: Box<dyn DynRenderPipeline>) {
@@ -618,5 +622,49 @@ impl<D: Device + DynResource> DynDevice for D {
 
     fn check_if_oom(&self) -> Result<(), DeviceError> {
         D::check_if_oom(self)
+    }
+}
+
+/// The render pipeline descriptor `desc` with each of its resources as `D`'s own.
+#[allow(clippy::type_complexity)]
+fn downcast_render_pipeline_descriptor<'a, D: Device + DynResource>(
+    desc: &'a RenderPipelineDescriptor<
+        'a,
+        dyn DynPipelineLayout,
+        dyn DynShaderModule,
+        dyn DynPipelineCache,
+    >,
+) -> RenderPipelineDescriptor<
+    'a,
+    <D::A as Api>::PipelineLayout,
+    <D::A as Api>::ShaderModule,
+    <D::A as Api>::PipelineCache,
+> {
+    RenderPipelineDescriptor {
+        label: desc.label,
+        layout: desc.layout.expect_downcast_ref(),
+        vertex_processor: match &desc.vertex_processor {
+            crate::VertexProcessor::Standard {
+                vertex_buffers,
+                vertex_stage,
+            } => crate::VertexProcessor::Standard {
+                vertex_buffers,
+                vertex_stage: vertex_stage.clone().expect_downcast(),
+            },
+            crate::VertexProcessor::Mesh {
+                task_stage: task,
+                mesh_stage: mesh,
+            } => crate::VertexProcessor::Mesh {
+                task_stage: task.as_ref().map(|a| a.clone().expect_downcast()),
+                mesh_stage: mesh.clone().expect_downcast(),
+            },
+        },
+        primitive: desc.primitive,
+        depth_stencil: desc.depth_stencil.clone(),
+        multisample: desc.multisample,
+        fragment_stage: desc.fragment_stage.clone().map(|f| f.expect_downcast()),
+        color_targets: desc.color_targets,
+        multiview_mask: desc.multiview_mask,
+        cache: desc.cache.map(|c| c.expect_downcast_ref()),
     }
 }

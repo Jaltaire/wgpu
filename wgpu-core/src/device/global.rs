@@ -1364,7 +1364,40 @@ impl Global {
 
         let device = self.hub.devices.get(device_id);
 
-        self.device_create_general_render_pipeline(desc.clone().into(), device, fid)
+        self.device_create_general_render_pipeline(desc.clone().into(), device, fid, None)
+    }
+
+    /// Creates a render pipeline as [`Self::device_create_render_pipeline`] does, but lets
+    /// the backend go on compiling and linking its shaders after this returns.
+    ///
+    /// When the pipeline is created, `ready` is called once it may be used, with `Ok`, or
+    /// with the error if its shaders fail to compile or link, which is then not reported to
+    /// the device. Until then the pipeline must not be used. `ready` is called before this
+    /// returns when that is already known, and otherwise by the [`Self::device_poll`] or
+    /// [`Self::queue_submit`] that finds it out. A device that is lost meanwhile calls
+    /// `ready` with `Ok`, as its pipelines are then invalid anyway.
+    ///
+    /// When the pipeline cannot be created, the error is returned and `ready` is dropped
+    /// without being called.
+    pub fn device_create_render_pipeline_in_background(
+        &self,
+        device_id: DeviceId,
+        desc: &pipeline::RenderPipelineDescriptor,
+        id_in: Option<id::RenderPipelineId>,
+        ready: pipeline::RenderPipelineReadyCallback,
+    ) -> (
+        id::RenderPipelineId,
+        Option<pipeline::CreateRenderPipelineError>,
+    ) {
+        profiling::scope!("Device::create_render_pipeline_in_background");
+
+        let hub = &self.hub;
+
+        let fid = hub.render_pipelines.prepare(id_in);
+
+        let device = self.hub.devices.get(device_id);
+
+        self.device_create_general_render_pipeline(desc.clone().into(), device, fid, Some(ready))
     }
 
     pub fn device_create_mesh_pipeline(
@@ -1381,7 +1414,7 @@ impl Global {
         let fid = hub.render_pipelines.prepare(id_in);
 
         let device = self.hub.devices.get(device_id);
-        self.device_create_general_render_pipeline(desc.clone().into(), device, fid)
+        self.device_create_general_render_pipeline(desc.clone().into(), device, fid, None)
     }
 
     fn device_create_general_render_pipeline(
@@ -1389,6 +1422,7 @@ impl Global {
         desc: pipeline::GeneralRenderPipelineDescriptor,
         device: Arc<crate::device::resource::Device>,
         fid: crate::registry::FutureId<Arc<pipeline::RenderPipeline>>,
+        ready: Option<pipeline::RenderPipelineReadyCallback>,
     ) -> (
         id::RenderPipelineId,
         Option<pipeline::CreateRenderPipelineError>,
@@ -1553,10 +1587,26 @@ impl Global {
                 cache,
             };
 
-            let (pipeline, error) = device.create_render_pipeline(desc);
+            let Some(ready) = ready else {
+                let (pipeline, error) = device.create_render_pipeline(desc);
+
+                let id = fid.assign(pipeline);
+                api_log!("Device::create_render_pipeline -> {id:?}");
+
+                return (id, error);
+            };
+
+            let (pipeline, error) = device.create_render_pipeline_in_background(desc);
+            let created = error.is_none().then(|| Arc::clone(&pipeline));
 
             let id = fid.assign(pipeline);
-            api_log!("Device::create_render_pipeline -> {id:?}");
+            api_log!("Device::create_render_pipeline_in_background -> {id:?}");
+
+            if let Some((ready, result)) =
+                created.and_then(|pipeline| device.await_render_pipeline(pipeline, ready))
+            {
+                ready(result);
+            }
 
             return (id, error);
         };

@@ -265,11 +265,15 @@ impl Device {
     /// instead of going to the current error scope or the uncaptured error handler.
     ///
     /// On WebGPU this calls [`GPUDevice.createRenderPipelineAsync()`], which lets the
-    /// browser compile the pipeline off the GPU process' main thread. Native backends have
-    /// no asynchronous form of pipeline creation: they create the pipeline before this
-    /// function returns, and the returned future is already resolved. If the device is
-    /// lost, the future resolves to an invalid pipeline, as with
-    /// [`Device::create_render_pipeline`].
+    /// browser compile the pipeline off the GPU process' main thread. On GL, including
+    /// WebGL2, the shaders are compiled and the program linked in the background, and the
+    /// future resolves on the [`Device::poll`] or [`Queue::submit`](crate::Queue::submit)
+    /// that finds the link complete, which it asks without waiting: through
+    /// `KHR_parallel_shader_compile` where the context has it, and otherwise once a fence
+    /// issued after the newest links has signalled. The other native backends have no
+    /// asynchronous form of pipeline creation: they create the pipeline before this function
+    /// returns, and the returned future is already resolved. If the device is lost, the
+    /// future resolves to an invalid pipeline, as with [`Device::create_render_pipeline`].
     ///
     /// [`GPUDevice.createRenderPipelineAsync()`]: https://developer.mozilla.org/en-US/docs/Web/API/GPUDevice/createRenderPipelineAsync
     pub fn create_render_pipeline_async(

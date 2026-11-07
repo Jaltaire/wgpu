@@ -520,6 +520,15 @@ pub enum PipelineError {
     PipelineConstants(wgt::ShaderStages, String),
 }
 
+/// How far the compilation of a pipeline begun by [`Device::begin_render_pipeline`] has come.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelineCompilation {
+    /// Its shaders are still being compiled or linked, and it must not be used yet.
+    Compiling,
+    /// It has compiled and been finished, and may be used.
+    Compiled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum PipelineCacheError {
     #[error(transparent)]
@@ -1079,6 +1088,36 @@ pub trait Device: WasmNotSendSync {
             <Self::A as Api>::PipelineCache,
         >,
     ) -> Result<<Self::A as Api>::RenderPipeline, PipelineError>;
+
+    /// Begins making a render pipeline whose shaders the backend may go on compiling and
+    /// linking after this returns, so the caller does not wait for them.
+    ///
+    /// The pipeline must not be used until [`Device::render_pipeline_compilation`] has said
+    /// it is [`PipelineCompilation::Compiled`]. A backend that cannot compile in the
+    /// background makes the pipeline as [`Device::create_render_pipeline`] does.
+    #[allow(clippy::type_complexity)]
+    unsafe fn begin_render_pipeline(
+        &self,
+        desc: &RenderPipelineDescriptor<
+            <Self::A as Api>::PipelineLayout,
+            <Self::A as Api>::ShaderModule,
+            <Self::A as Api>::PipelineCache,
+        >,
+    ) -> Result<<Self::A as Api>::RenderPipeline, PipelineError> {
+        unsafe { self.create_render_pipeline(desc) }
+    }
+
+    /// How far the compilation of `pipeline`, begun by [`Device::begin_render_pipeline`],
+    /// has come, asked without waiting for it. Once it has compiled, this finishes the
+    /// pipeline, after which it may be used; a pipeline that failed to compile gives the
+    /// error, and may only be destroyed.
+    unsafe fn render_pipeline_compilation(
+        &self,
+        _pipeline: &<Self::A as Api>::RenderPipeline,
+    ) -> Result<PipelineCompilation, PipelineError> {
+        Ok(PipelineCompilation::Compiled)
+    }
+
     unsafe fn destroy_render_pipeline(&self, pipeline: <Self::A as Api>::RenderPipeline);
 
     #[allow(clippy::type_complexity)]

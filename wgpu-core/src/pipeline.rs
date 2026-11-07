@@ -753,6 +753,27 @@ pub enum DepthStencilStateError {
     MissingDepthWriteEnabled(wgt::TextureFormat),
 }
 
+/// What a render pipeline made in the background is told once it may be used, or why it
+/// never may be ([`crate::global::Global::device_create_render_pipeline_in_background`]).
+#[cfg(send_sync)]
+pub type RenderPipelineReadyCallback =
+    Box<dyn FnOnce(Result<(), CreateRenderPipelineError>) + Send + 'static>;
+/// What a render pipeline made in the background is told once it may be used, or why it
+/// never may be ([`crate::global::Global::device_create_render_pipeline_in_background`]).
+#[cfg(not(send_sync))]
+pub type RenderPipelineReadyCallback =
+    Box<dyn FnOnce(Result<(), CreateRenderPipelineError>) + 'static>;
+
+/// When a render pipeline's shaders are compiled and linked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Compilation {
+    /// Before the pipeline is returned.
+    Now,
+    /// After it is returned, where the backend can go on in the background, so that the
+    /// pipeline may be used only once its device has said it has compiled.
+    InBackground,
+}
+
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum CreateRenderPipelineError {

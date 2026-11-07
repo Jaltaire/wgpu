@@ -178,6 +178,10 @@ pub struct UserClosures {
     pub mappings: Vec<BufferMapPendingClosure>,
     pub blas_compact_ready: Vec<BlasCompactReadyPendingClosure>,
     pub submissions: SmallVec<[queue::SubmittedWorkDoneClosure; 1]>,
+    pub render_pipelines: Vec<(
+        crate::pipeline::RenderPipelineReadyCallback,
+        Result<(), crate::pipeline::CreateRenderPipelineError>,
+    )>,
     pub device_lost_invocations: SmallVec<[DeviceLostInvocation; 1]>,
 }
 
@@ -186,6 +190,7 @@ impl UserClosures {
         self.mappings.extend(other.mappings);
         self.blas_compact_ready.extend(other.blas_compact_ready);
         self.submissions.extend(other.submissions);
+        self.render_pipelines.extend(other.render_pipelines);
         self.device_lost_invocations
             .extend(other.device_lost_invocations);
     }
@@ -208,6 +213,9 @@ impl UserClosures {
         }
         for closure in self.submissions {
             closure();
+        }
+        for (ready, result) in self.render_pipelines {
+            ready(result);
         }
         for invocation in self.device_lost_invocations {
             (invocation.closure)(invocation.reason, invocation.message);

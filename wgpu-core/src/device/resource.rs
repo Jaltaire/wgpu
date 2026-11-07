@@ -272,6 +272,9 @@ pub struct Device {
     pub(crate) ordered_texture_usages: wgt::TextureUses,
     pub(crate) instance_flags: wgt::InstanceFlags,
     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
+    /// Render pipelines whose shaders are compiling in the background, each with what it is
+    /// told once it may be used. [`Device::maintain`] asks how each has come along.
+    pub(crate) pending_render_pipelines: Mutex<Vec<PendingRenderPipeline>>,
     pub(crate) usage_scopes: UsageScopePool,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
     // Optional so that we can late-initialize this after the queue is created.
@@ -285,6 +288,13 @@ pub struct Device {
     // needs to be dropped last
     #[cfg(feature = "trace")]
     pub(crate) trace: Mutex<Option<Box<dyn trace::Trace + Send + Sync + 'static>>>,
+}
+
+/// A render pipeline compiling in the background ([`Device::pending_render_pipelines`]),
+/// held weakly so that a pipeline nobody holds any more is simply forgotten.
+pub(crate) struct PendingRenderPipeline {
+    pipeline: Weak<pipeline::RenderPipeline>,
+    ready: pipeline::RenderPipelineReadyCallback,
 }
 
 pub(crate) enum DeferredDestroy {
@@ -557,6 +567,7 @@ impl Device {
             ordered_texture_usages,
             instance_flags,
             deferred_destroy: Mutex::new(rank::DEVICE_DEFERRED_DESTROY, Vec::new()),
+            pending_render_pipelines: Mutex::new(rank::DEVICE_PENDING_RENDER_PIPELINES, Vec::new()),
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,
@@ -938,6 +949,8 @@ impl Device {
         } else {
             drop(snatch_guard);
         };
+
+        user_closures.render_pipelines = self.progress_render_pipelines();
 
         // Based on the queue empty status, and the current finished submission index, determine
         // the result of the poll.
@@ -4188,13 +4201,127 @@ impl Device {
         Arc<pipeline::RenderPipeline>,
         Option<pipeline::CreateRenderPipelineError>,
     ) {
-        let (render_pipeline, error) = match self.create_render_pipeline_inner(desc.clone()) {
-            Ok(pipeline) => (pipeline, None),
-            Err(e) => (
-                pipeline::RenderPipeline::invalid(self.clone(), desc.label.to_string()),
-                Some(e),
-            ),
-        };
+        self.create_render_pipeline_compiled(desc, pipeline::Compilation::Now)
+    }
+
+    /// Makes a render pipeline as [`Self::create_render_pipeline`] does, but leaves its
+    /// shaders compiling in the background where the backend can. The pipeline must not be
+    /// handed out before [`Self::await_render_pipeline`] has said it may be used.
+    pub(crate) fn create_render_pipeline_in_background(
+        self: &Arc<Self>,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+    ) -> (
+        Arc<pipeline::RenderPipeline>,
+        Option<pipeline::CreateRenderPipelineError>,
+    ) {
+        self.create_render_pipeline_compiled(desc, pipeline::Compilation::InBackground)
+    }
+
+    /// Says through `ready` when `render_pipeline`, made by
+    /// [`Self::create_render_pipeline_in_background`], may be used, or why it never may be.
+    /// When that is already known, gives `ready` back with the answer for the caller to call,
+    /// holding no lock; otherwise [`Self::maintain`] calls it once it is known.
+    pub(crate) fn await_render_pipeline(
+        &self,
+        render_pipeline: Arc<pipeline::RenderPipeline>,
+        ready: pipeline::RenderPipelineReadyCallback,
+    ) -> Option<(
+        pipeline::RenderPipelineReadyCallback,
+        Result<(), pipeline::CreateRenderPipelineError>,
+    )> {
+        match self.render_pipeline_compilation(&render_pipeline) {
+            Ok(hal::PipelineCompilation::Compiling) => {
+                self.pending_render_pipelines
+                    .lock()
+                    .push(PendingRenderPipeline {
+                        pipeline: Arc::downgrade(&render_pipeline),
+                        ready,
+                    });
+                None
+            }
+            Ok(hal::PipelineCompilation::Compiled) => Some((ready, Ok(()))),
+            Err(error) => Some((ready, Err(error))),
+        }
+    }
+
+    /// How far the compilation of `render_pipeline` has come, asked of the backend without
+    /// waiting for it. A device that is no longer valid has nothing left to compile.
+    fn render_pipeline_compilation(
+        &self,
+        render_pipeline: &pipeline::RenderPipeline,
+    ) -> Result<hal::PipelineCompilation, pipeline::CreateRenderPipelineError> {
+        if !self.is_valid() {
+            return Ok(hal::PipelineCompilation::Compiled);
+        }
+        let raw = render_pipeline.raw()?;
+        unsafe { self.raw().render_pipeline_compilation(raw) }
+            .map_err(|error| self.map_render_pipeline_error(error))
+    }
+
+    /// Asks how each render pipeline compiling in the background has come along, and gives
+    /// what each pipeline that is done is to be told, keeping the rest and forgetting those
+    /// nobody holds any more.
+    fn progress_render_pipelines(
+        &self,
+    ) -> Vec<(
+        pipeline::RenderPipelineReadyCallback,
+        Result<(), pipeline::CreateRenderPipelineError>,
+    )> {
+        let mut pending = self.pending_render_pipelines.lock();
+        let mut done = Vec::new();
+        for waiting in mem::take(&mut *pending) {
+            let Some(render_pipeline) = waiting.pipeline.upgrade() else {
+                continue;
+            };
+            match self.render_pipeline_compilation(&render_pipeline) {
+                Ok(hal::PipelineCompilation::Compiling) => pending.push(waiting),
+                Ok(hal::PipelineCompilation::Compiled) => done.push((waiting.ready, Ok(()))),
+                Err(error) => done.push((waiting.ready, Err(error))),
+            }
+        }
+        done
+    }
+
+    /// The error a backend's failure to make or compile a render pipeline is reported as.
+    fn map_render_pipeline_error(
+        &self,
+        error: hal::PipelineError,
+    ) -> pipeline::CreateRenderPipelineError {
+        match error {
+            hal::PipelineError::Device(error) => {
+                pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
+            }
+            hal::PipelineError::Linkage(stage, msg) => {
+                pipeline::CreateRenderPipelineError::Internal { stage, error: msg }
+            }
+            hal::PipelineError::EntryPoint(stage) => {
+                pipeline::CreateRenderPipelineError::Internal {
+                    stage: hal::auxil::map_naga_stage(stage),
+                    error: ENTRYPOINT_FAILURE_ERROR.to_string(),
+                }
+            }
+            hal::PipelineError::PipelineConstants(stage, error) => {
+                pipeline::CreateRenderPipelineError::PipelineConstants { stage, error }
+            }
+        }
+    }
+
+    fn create_render_pipeline_compiled(
+        self: &Arc<Self>,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+        compilation: pipeline::Compilation,
+    ) -> (
+        Arc<pipeline::RenderPipeline>,
+        Option<pipeline::CreateRenderPipelineError>,
+    ) {
+        let (render_pipeline, error) =
+            match self.create_render_pipeline_inner(desc.clone(), compilation) {
+                Ok(pipeline) => (pipeline, None),
+                Err(e) => (
+                    pipeline::RenderPipeline::invalid(self.clone(), desc.label.to_string()),
+                    Some(e),
+                ),
+            };
         #[cfg(feature = "trace")]
         if let Some(ref mut trace) = *self.trace.lock() {
             use crate::device::trace::IntoTrace;
@@ -4206,9 +4333,10 @@ impl Device {
         (render_pipeline, error)
     }
 
-    pub fn create_render_pipeline_inner(
+    pub(crate) fn create_render_pipeline_inner(
         self: &Arc<Self>,
         desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+        compilation: pipeline::Compilation,
     ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreateRenderPipelineError> {
         use wgt::TextureFormatFeatureFlags as Tfff;
 
@@ -4985,25 +5113,15 @@ impl Device {
                 multiview_mask: desc.multiview_mask,
                 cache: cache.as_ref().map(|it| it.raw()),
             };
-            unsafe { self.raw().create_render_pipeline(&pipeline_desc) }.map_err(
-                |err| match err {
-                    hal::PipelineError::Device(error) => {
-                        pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
-                    }
-                    hal::PipelineError::Linkage(stage, msg) => {
-                        pipeline::CreateRenderPipelineError::Internal { stage, error: msg }
-                    }
-                    hal::PipelineError::EntryPoint(stage) => {
-                        pipeline::CreateRenderPipelineError::Internal {
-                            stage: hal::auxil::map_naga_stage(stage),
-                            error: ENTRYPOINT_FAILURE_ERROR.to_string(),
-                        }
-                    }
-                    hal::PipelineError::PipelineConstants(stage, error) => {
-                        pipeline::CreateRenderPipelineError::PipelineConstants { stage, error }
-                    }
+            match compilation {
+                pipeline::Compilation::Now => unsafe {
+                    self.raw().create_render_pipeline(&pipeline_desc)
                 },
-            )?
+                pipeline::Compilation::InBackground => unsafe {
+                    self.raw().begin_render_pipeline(&pipeline_desc)
+                },
+            }
+            .map_err(|error| self.map_render_pipeline_error(error))?
         };
 
         let pass_context = RenderPassContext {

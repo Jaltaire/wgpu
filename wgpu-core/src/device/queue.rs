@@ -304,6 +304,7 @@ impl Drop for Queue {
             mappings: mapping_closures,
             blas_compact_ready: blas_compact_ready_closures,
             submissions: submission_closures,
+            render_pipelines: Vec::new(),
             device_lost_invocations: SmallVec::new(),
         };
 

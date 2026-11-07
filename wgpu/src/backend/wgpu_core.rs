@@ -10,11 +10,12 @@ use alloc::{
 use core::{
     error::Error,
     fmt,
-    future::ready,
+    future::{ready, Future},
     ops::{Deref, Range},
     pin::Pin,
     ptr::NonNull,
     slice,
+    task::{Context, Poll, Waker},
 };
 use hashbrown::HashMap;
 
@@ -1364,36 +1365,35 @@ impl dispatch::DeviceInterface for CoreDevice {
         &self,
         desc: &crate::RenderPipelineDescriptor<'_>,
     ) -> Pin<Box<dyn dispatch::CreateRenderPipelineFuture>> {
+        let readiness = Arc::new(Mutex::new(PipelineReadiness::default()));
+        let notifier = PipelineReadyNotifier {
+            readiness: Arc::clone(&readiness),
+        };
         let (id, error) = with_render_pipeline_descriptor(desc, |descriptor| {
-            self.context
-                .0
-                .device_create_render_pipeline(self.id, &descriptor, None)
+            self.context.0.device_create_render_pipeline_in_background(
+                self.id,
+                &descriptor,
+                None,
+                Box::new(move |result| notifier.tell(result)),
+            )
         });
         let pipeline = CoreRenderPipeline {
             context: self.context.clone(),
             id,
             error_sink: Arc::clone(&self.error_sink),
         };
-        let result = match error {
-            None => Ok(pipeline.into()),
-            // A lost device resolves to an invalid pipeline, as upstream's
-            // `create_render_pipeline_or_error` does; the loss surfaces via the device callback.
-            Some(cause) if cause.webgpu_error_type() == ErrorType::DeviceLost => {
-                Ok(pipeline.into())
-            }
-            // Any other failure is the future's `Err`, and nothing is raised on the device.
-            Some(cause) => {
-                log_render_shader_translation_error(&cause);
-                drop(pipeline);
-                Err(pipeline_error(
-                    &self.context,
-                    cause,
-                    desc.label,
-                    "Device::create_render_pipeline_async",
-                ))
-            }
-        };
-        Box::pin(ready(result))
+        match error {
+            None => Box::pin(ReadyRenderPipeline {
+                readiness,
+                pipeline: Some(pipeline),
+                label: desc.label.map(String::from),
+            }),
+            Some(cause) => Box::pin(ready(resolve_render_pipeline(
+                pipeline,
+                Err(cause),
+                desc.label,
+            ))),
+        }
     }
 
     fn create_mesh_pipeline(
@@ -4239,5 +4239,103 @@ fn pipeline_error(
             description: context.format_error(&*source),
             source,
         },
+    }
+}
+
+/// What wgpu-core has said of a render pipeline compiling in the background, and the task
+/// waiting to hear it.
+#[derive(Default)]
+struct PipelineReadiness {
+    told: Option<Result<(), wgc::pipeline::CreateRenderPipelineError>>,
+    abandoned: bool,
+    waker: Option<Waker>,
+}
+
+/// Tells a [`PipelineReadiness`] what wgpu-core says of its pipeline, or, dropped without
+/// telling it, that wgpu-core will never say, as when the device is dropped first.
+struct PipelineReadyNotifier {
+    readiness: Arc<Mutex<PipelineReadiness>>,
+}
+
+impl PipelineReadyNotifier {
+    fn tell(self, result: Result<(), wgc::pipeline::CreateRenderPipelineError>) {
+        self.readiness.lock().told = Some(result);
+    }
+}
+
+impl Drop for PipelineReadyNotifier {
+    fn drop(&mut self) {
+        let waker = {
+            let mut readiness = self.readiness.lock();
+            if readiness.told.is_none() {
+                readiness.abandoned = true;
+            }
+            readiness.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Resolves once wgpu-core says the render pipeline it holds, compiling in the background,
+/// may be used, or why it never may be.
+struct ReadyRenderPipeline {
+    readiness: Arc<Mutex<PipelineReadiness>>,
+    pipeline: Option<CoreRenderPipeline>,
+    label: Option<String>,
+}
+
+impl Future for ReadyRenderPipeline {
+    type Output = Result<dispatch::DispatchRenderPipeline, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let told = {
+            let mut readiness = self.readiness.lock();
+            match readiness.told.take() {
+                Some(told) => told,
+                None if readiness.abandoned => {
+                    Err(wgc::pipeline::CreateRenderPipelineError::Device(
+                        wgc::device::DeviceError::Lost,
+                    ))
+                }
+                None => {
+                    readiness.waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        };
+        let pipeline = self
+            .pipeline
+            .take()
+            .expect("A render pipeline was polled again after it had resolved.");
+        let label = self.label.take();
+        Poll::Ready(resolve_render_pipeline(pipeline, told, label.as_deref()))
+    }
+}
+
+/// What a render pipeline created asynchronously resolves to, from what wgpu-core said of it.
+fn resolve_render_pipeline(
+    pipeline: CoreRenderPipeline,
+    told: Result<(), wgc::pipeline::CreateRenderPipelineError>,
+    label: Option<&str>,
+) -> Result<dispatch::DispatchRenderPipeline, crate::Error> {
+    match told {
+        Ok(()) => Ok(pipeline.into()),
+        // A lost device resolves to an invalid pipeline, as upstream's
+        // `create_render_pipeline_or_error` does; the loss surfaces via the device callback.
+        Err(cause) if cause.webgpu_error_type() == ErrorType::DeviceLost => Ok(pipeline.into()),
+        // Any other failure is the future's `Err`, and nothing is raised on the device.
+        Err(cause) => {
+            log_render_shader_translation_error(&cause);
+            let context = pipeline.context.clone();
+            drop(pipeline);
+            Err(pipeline_error(
+                &context,
+                cause,
+                label,
+                "Device::create_render_pipeline_async",
+            ))
+        }
     }
 }

@@ -925,7 +925,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             }
         }
 
-        self.set_pipeline_inner(&pipeline.inner);
+        let inner = pipeline.program.inner();
+        self.set_pipeline_inner(&inner);
 
         // set primitive state
         let prim_state = conv::map_primitive_state(&pipeline.primitive);
@@ -1012,12 +1013,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
         }
 
         // set clip plane count
-        if pipeline.inner.clip_distance_count != self.state.clip_distance_count {
+        if inner.clip_distance_count != self.state.clip_distance_count {
             self.cmd_buffer.commands.push(C::SetClipDistances {
                 old_count: self.state.clip_distance_count,
-                new_count: pipeline.inner.clip_distance_count,
+                new_count: inner.clip_distance_count,
             });
-            self.state.clip_distance_count = pipeline.inner.clip_distance_count;
+            self.state.clip_distance_count = inner.clip_distance_count;
         }
     }
 
@@ -1249,7 +1250,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &super::ComputePipeline) {
-        self.set_pipeline_inner(&pipeline.inner);
+        self.set_pipeline_inner(&pipeline.program.inner());
     }
 
     unsafe fn dispatch_workgroups(&mut self, count: [u32; 3]) {

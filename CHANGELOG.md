@@ -45,6 +45,7 @@ Bottom level categories:
 ### New Features
 
 - Added `Device::create_render_pipeline_async` and `Device::create_compute_pipeline_async`. On the WebGPU backend they call `createRenderPipelineAsync()`/`createComputePipelineAsync()`, which let the browser compile the pipeline off the GPU process' main thread. On every backend, validation and internal failures are reported through the returned future instead of the error scope. On native backends the pipeline is still created synchronously and the returned future is already resolved. Resolves [#3794](https://github.com/gfx-rs/wgpu/issues/3794). By @abdymazhit in [#10438](https://github.com/gfx-rs/wgpu/pull/10438).
+- On the GL backend, including WebGL2, `Device::create_render_pipeline_async` compiles and links the pipeline's program in the background, and asks nothing of it until the link has completed: it asks `COMPLETION_STATUS_KHR` where `KHR_parallel_shader_compile` is available, and otherwise waits for a fence issued after the newest links. The future resolves on the `Device::poll` or `Queue::submit` that finds the link complete. On the web, this keeps a page from waiting on each compile and link in turn. Synchronous creation no longer asks each stage's compile status before linking, and reads it only if the link fails.
 
 ## v30.0.1 (2026-08-21)
 

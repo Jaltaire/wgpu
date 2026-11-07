@@ -726,6 +726,12 @@ impl super::Adapter {
             super::PrivateCapabilities::TEXTURE_FORMAT_NORM16_STORAGE,
             supports_16bit_norm_storage,
         );
+        private_caps.set(
+            super::PrivateCapabilities::PARALLEL_SHADER_COMPILE,
+            extensions.contains("KHR_parallel_shader_compile")
+                || extensions.contains("GL_KHR_parallel_shader_compile")
+                || extensions.contains("GL_ARB_parallel_shader_compile"),
+        );
 
         // GLSL ES 3.10+ / GLSL 4.30+ natively support coherent/volatile qualifiers
         // on storage buffers. These were introduced alongside storage buffer support.
@@ -956,6 +962,7 @@ impl super::Adapter {
                     shading_language_version,
                     next_shader_id: Default::default(),
                     program_cache: Default::default(),
+                    link_fence: Default::default(),
                     es: es_ver.is_some(),
                     max_msaa_samples: max_samples,
                 }),
