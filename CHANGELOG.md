@@ -363,6 +363,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 - Enable the `depthBiasClamp` device feature when it is supported. Pipelines with a non-zero `DepthBiasState::clamp` previously failed Vulkan validation. By @VoxelBoy in [#10566](https://github.com/gfx-rs/wgpu/pull/10566).
 - Fix a crash in `vkQueueSubmit` on Imagination's proprietary driver and on the Android 16 emulator by passing a timeline value for every semaphore whenever a submission uses timeline semaphore values. By @laurenz-canva in [#10677](https://github.com/gfx-rs/wgpu/pull/10677).
 - Polyfill workgroup zero init in mesh and task shaders on AMD's proprietary driver, which fails with `VK_ERROR_INITIALIZATION_FAILED` when they use `OpVariable` initializers. By @apollo-2006 in [#10692](https://github.com/gfx-rs/wgpu/pull/10692).
+- Leave debug labels and object names off, instead of aborting, on a driver that lists `VK_EXT_debug_utils` but returns null from `vkGetDeviceProcAddr` for its device commands, as an Adreno 730 driver on Android 13 does. By @Jaltaire in [#XXXXX](https://github.com/gfx-rs/wgpu/pull/XXXXX).
 
 #### Metal
 

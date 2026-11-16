@@ -2707,10 +2707,25 @@ impl super::Adapter {
         // level) but contains a few functions that can be loaded directly on the Device for a
         // dispatch-table-less pointer.
         let debug_utils_fn = if self.instance.extensions.contains(&ext::debug_utils::NAME) {
-            Some(ext::debug_utils::Device::new(
-                &self.instance.raw,
-                &raw_device,
-            ))
+            match first_unresolved_command(&DEBUG_UTILS_DEVICE_COMMANDS, |name| {
+                unsafe {
+                    self.instance
+                        .raw
+                        .get_device_proc_addr(raw_device.handle(), name.as_ptr())
+                }
+                .is_some()
+            }) {
+                None => Some(ext::debug_utils::Device::new(
+                    &self.instance.raw,
+                    &raw_device,
+                )),
+                Some(unresolved) => {
+                    log::warn!(
+                        "VK_EXT_debug_utils is enabled, but vkGetDeviceProcAddr returned null for {unresolved:?}, so this device sets no debug labels or object names"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -3676,4 +3691,55 @@ fn query_cooperative_matrix_properties(
         result.len()
     );
     result
+}
+
+const DEBUG_UTILS_DEVICE_COMMANDS: [&CStr; 4] = [
+    c"vkSetDebugUtilsObjectNameEXT",
+    c"vkCmdBeginDebugUtilsLabelEXT",
+    c"vkCmdEndDebugUtilsLabelEXT",
+    c"vkCmdInsertDebugUtilsLabelEXT",
+];
+
+fn first_unresolved_command<'a>(
+    commands: &[&'a CStr],
+    mut resolves: impl FnMut(&CStr) -> bool,
+) -> Option<&'a CStr> {
+    commands.iter().copied().find(|name| !resolves(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_utils_are_loaded_when_every_command_wgpu_calls_resolves() {
+        assert_eq!(
+            first_unresolved_command(&DEBUG_UTILS_DEVICE_COMMANDS, |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_debug_utils_command_the_driver_does_not_return_is_named() {
+        assert_eq!(
+            first_unresolved_command(&DEBUG_UTILS_DEVICE_COMMANDS, |name| {
+                name != c"vkSetDebugUtilsObjectNameEXT"
+            }),
+            Some(c"vkSetDebugUtilsObjectNameEXT")
+        );
+        assert_eq!(
+            first_unresolved_command(&DEBUG_UTILS_DEVICE_COMMANDS, |name| {
+                name != c"vkCmdInsertDebugUtilsLabelEXT"
+            }),
+            Some(c"vkCmdInsertDebugUtilsLabelEXT")
+        );
+    }
+
+    #[test]
+    fn the_first_unresolved_command_is_named_in_order() {
+        assert_eq!(
+            first_unresolved_command(&DEBUG_UTILS_DEVICE_COMMANDS, |_| false),
+            Some(c"vkSetDebugUtilsObjectNameEXT")
+        );
+    }
 }
